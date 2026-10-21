@@ -1,0 +1,94 @@
+name: Binance Listing Alert
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Binance announcements
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          import urllib.error
+          import pathlib
+          import re
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+          if not token or not chat_id:
+              raise SystemExit("Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets.")
+
+          url = "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query"
+          params = urllib.parse.urlencode({
+              "type": 1,
+              "catalogId": 48,
+              "pageNo": 1,
+              "pageSize": 20
+          })
+          req = urllib.request.Request(
+              url + "?" + params,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+          except Exception as exc:
+              raise SystemExit(f"Could not retrieve Binance announcements: {exc}")
+
+          articles = data.get("data", {}).get("articles", [])
+          if not articles:
+              print("No articles returned; check whether Binance changed its endpoint.")
+              raise SystemExit(1)
+
+          state_file = pathlib.Path("seen_articles.json")
+          seen = set(json.loads(state_file.read_text())) if state_file.exists() else set()
+          keywords = re.compile(
+              r"\b(listing|will list|to list|spot trading|new trading pairs)\b",
+              re.I
+          )
+
+          for article in articles:
+              article_id = str(article.get("id", ""))
+              title = article.get("title", "")
+              if not article_id or article_id in seen:
+                  continue
+              seen.add(article_id)
+
+              if keywords.search(title):
+                  link = "https://www.binance.com/en/support/announcement/" + article_id
+                  message = f"Binance announcement to review:\n{title}\n{link}"
+                  payload = urllib.parse.urlencode({
+                      "chat_id": chat_id,
+                      "text": message
+                  }).encode()
+                  telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+                  telegram_req = urllib.request.Request(telegram_url, data=payload)
+                  with urllib.request.urlopen(telegram_req, timeout=20) as response:
+                      print("Telegram response:", response.read().decode())
+
+          state_file.write_text(json.dumps(sorted(seen)))
+          print("Monitoring check completed.")
+          PY
+
+      - name: Save seen announcements
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_articles.json
+          git diff --cached --quiet || git commit -m "Update seen announcements"
+          git push
